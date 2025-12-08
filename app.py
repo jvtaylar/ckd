@@ -10,7 +10,7 @@ tf.get_logger().setLevel('ERROR')
 st.set_page_config(layout="wide")
 
 # ===============================================================
-# 1. HARDENED FILE CHECKER
+# 1. CHECK REQUIRED FILES
 # ===============================================================
 REQUIRED_FILES = [
     "scaler.joblib",
@@ -24,64 +24,25 @@ REQUIRED_FILES = [
 ]
 
 missing_files = [f for f in REQUIRED_FILES if not os.path.exists(f)]
-
 if missing_files:
-    st.error("❌ **Missing model files!** Your app cannot run.")
-    st.write("The following required files were NOT found:")
+    st.error("❌ Missing model files!")
     st.write(missing_files)
     st.stop()
 
 # ===============================================================
-# 2. LOAD MODELS SAFELY
+# 2. LOAD SCALER, ENCODER, META-CLASSIFIER (CACHED)
 # ===============================================================
 @st.cache_resource(show_spinner=True)
-def load_all_artifacts():
+def load_core_models():
+    scaler = joblib.load("scaler.joblib")
+    encoder = joblib.load("encoder.joblib")
+    meta_classifier = load_model("final_stacked_model.h5")
+    return scaler, encoder, meta_classifier
 
-    try:
-        scaler = joblib.load("scaler.joblib")
-    except Exception as e:
-        st.error(f"❌ Failed to load scaler.joblib\n{e}")
-        st.stop()
-
-    try:
-        encoder = joblib.load("encoder.joblib")
-    except Exception as e:
-        st.error(f"❌ Failed to load encoder.joblib\n{e}")
-        st.stop()
-
-    try:
-        final_meta_classifier = load_model("final_stacked_model.h5")
-    except Exception as e:
-        st.error(f"❌ Failed to load final_stacked_model.h5\n{e}")
-        st.stop()
-
-    # Load base classifiers safely
-    base_info = {
-        "KNN": "base_classifier_knn.joblib",
-        "RandomForest": "base_classifier_randomforest.joblib",
-        "ANN_base": "base_classifier_ann_base.h5",
-        "DecisionTree": "base_classifier_decisiontree.joblib",
-        "SVM": "base_classifier_svm.joblib",
-    }
-
-    base_models = {}
-    for name, path in base_info.items():
-        try:
-            if path.endswith(".h5"):
-                base_models[name] = load_model(path)
-            else:
-                base_models[name] = joblib.load(path)
-        except Exception as e:
-            st.error(f"❌ Failed to load {path}\n{e}")
-            st.stop()
-
-    return scaler, encoder, final_meta_classifier, base_models
-
-
-scaler, encoder, final_meta_classifier, base_models = load_all_artifacts()
+scaler, encoder, meta_classifier = load_core_models()
 
 # ===============================================================
-# 3. FEATURE DEFINITIONS
+# 3. FEATURES
 # ===============================================================
 numerical_features = ['age', 'bp', 'sg', 'al', 'su', 'bgr', 'bu', 'sc',
                       'sod', 'pot', 'hemo', 'pcv', 'wbcc', 'rbcc']
@@ -89,19 +50,10 @@ numerical_features = ['age', 'bp', 'sg', 'al', 'su', 'bgr', 'bu', 'sc',
 categorical_features = ['rbc', 'pc', 'pcc', 'ba', 'htn', 'dm', 'cad',
                         'appet', 'pe', 'ane']
 
-# encoder feature names
-try:
-    encoder_feature_names = encoder.get_feature_names_out(categorical_features)
-except Exception as e:
-    st.error("❌ Your encoder is incompatible with this scikit-learn version.")
-    st.write(e)
-    st.stop()
-
+encoder_feature_names = encoder.get_feature_names_out(categorical_features)
 trained_feature_columns = numerical_features + list(encoder_feature_names)
 
-# ===============================================================
-# 4. DEFAULT VALUES
-# ===============================================================
+# Defaults
 numerical_defaults = {
     'age': 46.3, 'bp': 76.2, 'sg': 1.0174, 'al': 1.0183, 'su': 0.46,
     'bgr': 148.03, 'bu': 57.43, 'sc': 3.07, 'sod': 137.5, 'pot': 4.63,
@@ -119,16 +71,15 @@ categorical_choices = {
 }
 
 # ===============================================================
-# 5. UI
+# 4. UI
 # ===============================================================
-st.title("⚕️ Chronic Kidney Disease Prediction App")
-st.write("Enter patient information to generate a prediction.")
+st.title("⚕️ Chronic Kidney Disease Prediction")
+st.write("Enter patient information to get a prediction.")
 st.markdown("---")
 
 st.sidebar.header("Patient Data Input")
 input_data = {}
 
-# Numerical
 for feature in numerical_features:
     input_data[feature] = st.sidebar.number_input(
         feature.upper(),
@@ -136,7 +87,6 @@ for feature in numerical_features:
         step=0.1
     )
 
-# Categorical
 for feature in categorical_features:
     choices = categorical_choices[feature]
     default = categorical_defaults.get(feature, choices[0])
@@ -147,76 +97,68 @@ for feature in categorical_features:
     )
 
 # ===============================================================
-# 6. PREPROCESSING
+# 5. PREPROCESS INPUT
 # ===============================================================
 def preprocess_input(data):
-
     df = pd.DataFrame([data])
-
-    # Numerical scaling
-    try:
-        scaled = scaler.transform(df[numerical_features])
-    except Exception as e:
-        st.error("❌ Error scaling numerical features.")
-        st.write(e)
-        st.stop()
-
+    scaled = scaler.transform(df[numerical_features])
     scaled_df = pd.DataFrame(scaled, columns=numerical_features)
 
-    # Encoding
-    try:
-        encoded = encoder.transform(df[categorical_features])
-    except Exception as e:
-        st.error("❌ Error encoding categorical features.")
-        st.write(e)
-        st.stop()
-
+    encoded = encoder.transform(df[categorical_features])
     encoded_df = pd.DataFrame(encoded, columns=encoder_feature_names)
 
-    # Combine
     final_df = pd.DataFrame(columns=trained_feature_columns)
     for col in final_df.columns:
-        final_df[col] = scaled_df[col] if col in scaled_df else encoded_df.get(col, 0)
-
+        if col in scaled_df:
+            final_df[col] = scaled_df[col]
+        elif col in encoded_df:
+            final_df[col] = encoded_df[col]
+        else:
+            final_df[col] = 0
     return final_df
 
+# ===============================================================
+# 6. LAZY-LOAD BASE MODELS
+# ===============================================================
+def load_base_model(name):
+    path_map = {
+        "KNN": "base_classifier_knn.joblib",
+        "RandomForest": "base_classifier_randomforest.joblib",
+        "ANN_base": "base_classifier_ann_base.h5",
+        "DecisionTree": "base_classifier_decisiontree.joblib",
+        "SVM": "base_classifier_svm.joblib"
+    }
+    path = path_map[name]
+    if path.endswith(".h5"):
+        return load_model(path)
+    else:
+        return joblib.load(path)
 
 # ===============================================================
-# 7. META-FEATURE GENERATION
+# 7. GENERATE META FEATURES
 # ===============================================================
 def generate_meta_features(df):
     meta = pd.DataFrame()
     order = ["KNN", "RandomForest", "ANN_base", "DecisionTree", "SVM"]
 
     for name in order:
-        model = base_models[name]
-
+        model = load_base_model(name)
         if isinstance(model, Sequential):
             pred = model.predict(df, verbose=0).flatten()
         else:
             pred = model.predict_proba(df)[:, 1]
-
         meta[name] = pred
-
     return meta
 
-
 # ===============================================================
-# 8. PREDICTION
+# 8. PREDICT
 # ===============================================================
 if st.sidebar.button("Predict"):
 
     processed = preprocess_input(input_data)
     meta = generate_meta_features(processed)
 
-    try:
-        final_prob = final_meta_classifier.predict(meta, verbose=0)[0][0]
-    except Exception as e:
-        st.error("❌ Final model prediction failed. Input shape mismatch.")
-        st.write(f"Expected input shape: ?,?,? ; Provided: {meta.shape}")
-        st.write(e)
-        st.stop()
-
+    final_prob = meta_classifier.predict(meta, verbose=0)[0][0]
     label = int(final_prob > 0.5)
 
     st.subheader("Prediction Result")
@@ -225,7 +167,7 @@ if st.sidebar.button("Predict"):
     else:
         st.success(f"No CKD Detected — Probability: {final_prob:.4f}")
 
-    # Debug
+    # Debug info
     st.markdown("---")
     with st.expander("🔍 Debug Information"):
         st.write("Raw Input:", pd.DataFrame([input_data]))
